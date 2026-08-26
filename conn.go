@@ -38,8 +38,9 @@ import (
 // [sdp.SessionDescription] values during negotiation.
 //
 // Once established and negotiated through either Dialer or Listener, Conn handles messages sent
-// over the 'ReliableDataChannel' (which may be read using Read or ReadPacket), and ensures closure
-// of its WebRTC transports to confirm that all transports within Conn are closed.
+// over the 'ReliableDataChannel' (which may be read using Read or ReadPacket) and the
+// 'UnreliableDataChannel' (which may be read using ReadPacket), and ensures closure of its WebRTC
+// transports to confirm that all transports within Conn are closed.
 type Conn struct {
 	ice      *webrtc.ICETransport
 	dtls     *webrtc.DTLSTransport
@@ -134,11 +135,26 @@ func (conn *Conn) Receive(r MessageReliability) ([]byte, error) {
 	}
 }
 
-// ReadPacket receives a message from the 'ReliableDataChannel' and returns the bytes. It is
-// implemented for Minecraft read operations to avoid some bugs related to the Read method in
-// their decoder.
+// ReadPacket receives a message from either the 'ReliableDataChannel' or the 'UnreliableDataChannel'
+// and returns the bytes. It is implemented for Minecraft read operations to avoid some bugs related
+// to the Read method in their decoder.
+//
+// Both data channels are read here because nothing else drains the 'UnreliableDataChannel': a message
+// sent with MessageReliabilityUnreliable would otherwise sit in its packets channel forever, blocking
+// the data channel's read loop and never reaching a caller.
+//
+// Messages from the two data channels interleave in arbitrary relative order at the caller: a
+// message read here may have arrived on either channel, and the order between channels is not
+// preserved, only the order within each.
 func (conn *Conn) ReadPacket() ([]byte, error) {
-	return conn.Receive(MessageReliabilityReliable)
+	select {
+	case <-conn.ctx.Done():
+		return nil, errors.Join(context.Cause(conn.ctx), net.ErrClosed)
+	case pk := <-conn.channel(MessageReliabilityReliable).packets:
+		return pk, nil
+	case pk := <-conn.channel(MessageReliabilityUnreliable).packets:
+		return pk, nil
+	}
 }
 
 // BatchHeader always returns a nil slice as no header is prefixed before packets.

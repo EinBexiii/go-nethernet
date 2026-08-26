@@ -223,6 +223,90 @@ func TestListenerRejectsDuplicateConn(t *testing.T) {
 	}
 }
 
+func TestConnReadPacketReceivesUnreliableMessage(t *testing.T) {
+	client, server := newLoopbackConns(t)
+
+	const payload = "unreliable-ping"
+	if _, err := client.Send([]byte(payload), MessageReliabilityUnreliable); err != nil {
+		t.Fatalf("Send() over UnreliableDataChannel error = %v", err)
+	}
+
+	read := make(chan []byte, 1)
+	readErr := make(chan error, 1)
+	go func() {
+		pk, err := server.ReadPacket()
+		if err != nil {
+			readErr <- err
+			return
+		}
+		read <- pk
+	}()
+
+	select {
+	case got := <-read:
+		if string(got) != payload {
+			t.Fatalf("ReadPacket() = %q, want %q", got, payload)
+		}
+	case err := <-readErr:
+		t.Fatalf("ReadPacket() error = %v", err)
+	case <-time.After(time.Second * 5):
+		t.Fatal("ReadPacket() timed out waiting for a message sent over UnreliableDataChannel")
+	}
+}
+
+// newLoopbackConns dials and accepts a Conn pair over an in-memory signaling bus, returning once
+// Accept confirms both the 'ReliableDataChannel' and 'UnreliableDataChannel' have opened on the
+// server side (DialContext does not separately await the client's own channels opening).
+//
+// The signaling endpoints are closed with defer before the test body runs, rather than through
+// t.Cleanup like the Conns: an established Conn pair outlives its signaling transport by design,
+// so signaling can close early while the Conns stay open for the caller.
+func newLoopbackConns(t *testing.T) (client, server *Conn) {
+	t.Helper()
+
+	clientSignaling, serverSignaling := newMemorySignalingPair("1", "2")
+	defer clientSignaling.close()
+	defer serverSignaling.close()
+
+	l, err := (ListenConfig{AllowAnonymous: true}).Listen(serverSignaling)
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+
+	accepted := make(chan net.Conn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		conn, err := l.Accept()
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- conn
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	defer cancel()
+
+	client, err = (Dialer{}).DialContext(ctx, serverSignaling.NetworkID(), clientSignaling)
+	if err != nil {
+		t.Fatalf("DialContext() error = %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	select {
+	case conn := <-accepted:
+		server = conn.(*Conn)
+	case err := <-acceptErr:
+		t.Fatalf("Accept() error = %v", err)
+	case <-ctx.Done():
+		t.Fatalf("Accept() timed out: %v", ctx.Err())
+	}
+	t.Cleanup(func() { _ = server.Close() })
+
+	return client, server
+}
+
 func testDialListener(t *testing.T, disableTrickle bool) {
 	t.Helper()
 
