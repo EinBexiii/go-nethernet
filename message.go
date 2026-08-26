@@ -20,11 +20,11 @@ const (
 	// MessageReliabilityReliable guarantees the ordering of messages. Currently, this is the
 	// only reliability parameter used in the game.
 	MessageReliabilityReliable MessageReliability = iota
-	// MessageReliabilityUnreliable seems to be unused, and it is unclear how it
-	// works with multiple segments as packet drops could leave the message data
-	// in unconstructed state.
-	// While it is technically possible to send or receive packets in this channel,
-	// it is currently recommended to use only MessageReliabilityReliable.
+	// MessageReliabilityUnreliable neither orders nor guarantees delivery of messages, and
+	// cannot fragment a message across multiple segments: a message larger than one segment
+	// would leave data in an unconstructed state on packet loss, so it is limited to a single
+	// segment. [Conn.WriteUnreliable] sends messages with this reliability, falling back to
+	// MessageReliabilityReliable for messages that would need more than one segment.
 	MessageReliabilityUnreliable
 
 	// messageReliabilityCapacity is the maximum value for MessageReliability, used as the capacity for array.

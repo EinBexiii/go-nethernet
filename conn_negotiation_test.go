@@ -254,6 +254,126 @@ func TestConnReadPacketReceivesUnreliableMessage(t *testing.T) {
 	}
 }
 
+func TestConnWriteUnreliableDeliversSmallPayload(t *testing.T) {
+	client, server := newLoopbackConns(t)
+
+	const payload = "hi"
+	n, err := client.WriteUnreliable([]byte(payload))
+	if err != nil {
+		t.Fatalf("WriteUnreliable() error = %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("WriteUnreliable() n = %d, want %d", n, len(payload))
+	}
+
+	read := make(chan []byte, 1)
+	readErr := make(chan error, 1)
+	go func() {
+		pk, err := server.ReadPacket()
+		if err != nil {
+			readErr <- err
+			return
+		}
+		read <- pk
+	}()
+
+	select {
+	case got := <-read:
+		if string(got) != payload {
+			t.Fatalf("ReadPacket() = %q, want %q", got, payload)
+		}
+	case err := <-readErr:
+		t.Fatalf("ReadPacket() error = %v", err)
+	case <-time.After(time.Second * 5):
+		t.Fatal("ReadPacket() timed out waiting for a message sent over WriteUnreliable")
+	}
+}
+
+func TestConnWriteUnreliableFallsBackToReliableForOversizePayload(t *testing.T) {
+	client, server := newLoopbackConns(t)
+
+	// Shrink the segment size so a small payload already exceeds what a single message on the
+	// UnreliableDataChannel can carry, forcing WriteUnreliable onto the fallback path. If it sent
+	// over UnreliableDataChannel regardless, Send would reject it for exceeding the segment size.
+	client.maxSegmentPayload.Store(4)
+
+	const payload = "payload larger than one segment"
+	n, err := client.WriteUnreliable([]byte(payload))
+	if err != nil {
+		t.Fatalf("WriteUnreliable() error = %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("WriteUnreliable() n = %d, want %d", n, len(payload))
+	}
+
+	read := make(chan []byte, 1)
+	readErr := make(chan error, 1)
+	go func() {
+		pk, err := server.ReadPacket()
+		if err != nil {
+			readErr <- err
+			return
+		}
+		read <- pk
+	}()
+
+	select {
+	case got := <-read:
+		if string(got) != payload {
+			t.Fatalf("ReadPacket() = %q, want %q", got, payload)
+		}
+	case err := <-readErr:
+		t.Fatalf("ReadPacket() error = %v", err)
+	case <-time.After(time.Second * 5):
+		t.Fatal("ReadPacket() timed out waiting for the fallback message sent over ReliableDataChannel")
+	}
+}
+
+// TestConnWriteUnreliableFallbackBoundary pins the exact byte at which WriteUnreliable switches
+// from the 'UnreliableDataChannel' to the fallback 'ReliableDataChannel', reading directly from
+// each dataChannel's packets queue rather than through ReadPacket so the two cases can't be
+// confused with one another.
+func TestConnWriteUnreliableFallbackBoundary(t *testing.T) {
+	const segmentSize = 4
+
+	t.Run("stays unreliable at exactly segmentSize", func(t *testing.T) {
+		client, server := newLoopbackConns(t)
+		client.maxSegmentPayload.Store(segmentSize)
+
+		payload := []byte("boun") // len(payload) == segmentSize
+		if _, err := client.WriteUnreliable(payload); err != nil {
+			t.Fatalf("WriteUnreliable() error = %v", err)
+		}
+		assertReceivedOn(t, server.channel(MessageReliabilityUnreliable), payload)
+	})
+
+	t.Run("falls back to reliable at segmentSize+1", func(t *testing.T) {
+		client, server := newLoopbackConns(t)
+		client.maxSegmentPayload.Store(segmentSize)
+
+		payload := []byte("bound") // len(payload) == segmentSize+1
+		if _, err := client.WriteUnreliable(payload); err != nil {
+			t.Fatalf("WriteUnreliable() error = %v", err)
+		}
+		assertReceivedOn(t, server.channel(MessageReliabilityReliable), payload)
+	})
+}
+
+// assertReceivedOn asserts that payload arrives on ch's packets queue specifically, pinning which
+// data channel carried a message rather than accepting it from either, as ReadPacket would.
+func assertReceivedOn(t *testing.T, ch *dataChannel, payload []byte) {
+	t.Helper()
+
+	select {
+	case got := <-ch.packets:
+		if string(got) != string(payload) {
+			t.Fatalf("received %q on %q, want %q", got, ch.Label(), payload)
+		}
+	case <-time.After(time.Second * 5):
+		t.Fatalf("timed out waiting for a message on %q", ch.Label())
+	}
+}
+
 // newLoopbackConns dials and accepts a Conn pair over an in-memory signaling bus, returning once
 // Accept confirms both the 'ReliableDataChannel' and 'UnreliableDataChannel' have opened on the
 // server side (DialContext does not separately await the client's own channels opening).

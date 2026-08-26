@@ -65,6 +65,21 @@ func TestConnReadKeepsRemainderWhenBufferIsShort(t *testing.T) {
 	}
 }
 
+func TestConnWriteUnreliableAfterCloseErrorsLikeWrite(t *testing.T) {
+	cause := errors.New("nethernet: connection closed for testing")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(cause)
+
+	conn := &Conn{ctx: ctx}
+
+	if _, err := conn.Write([]byte("hello")); !errors.Is(err, net.ErrClosed) || !errors.Is(err, cause) {
+		t.Fatalf("Write() after close error = %v, want net.ErrClosed and %v", err, cause)
+	}
+	if _, err := conn.WriteUnreliable([]byte("hello")); !errors.Is(err, net.ErrClosed) || !errors.Is(err, cause) {
+		t.Fatalf("WriteUnreliable() after close error = %v, want net.ErrClosed and %v", err, cause)
+	}
+}
+
 func TestIsTerminalICEState(t *testing.T) {
 	for state, terminal := range map[webrtc.ICETransportState]bool{
 		webrtc.ICETransportStateUnknown:      false,

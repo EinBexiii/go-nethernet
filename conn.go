@@ -196,6 +196,20 @@ func (conn *Conn) Write(b []byte) (n int, err error) {
 	return conn.Send(b, MessageReliabilityReliable)
 }
 
+// WriteUnreliable writes the data into the 'UnreliableDataChannel'. Delivery is neither ordered
+// nor guaranteed: the remote peer may receive messages out of order, or not receive them at all.
+//
+// The 'UnreliableDataChannel' cannot fragment a message across segments, so if the data would
+// require more than one segment, WriteUnreliable falls back to sending it over the
+// 'ReliableDataChannel' instead, the same way Write does. An error may be returned while writing
+// the data or if the Conn has been closed by [Conn.Close].
+func (conn *Conn) WriteUnreliable(b []byte) (n int, err error) {
+	if len(b) > conn.segmentSize() {
+		return conn.Send(b, MessageReliabilityReliable)
+	}
+	return conn.Send(b, MessageReliabilityUnreliable)
+}
+
 // Send writes the data into the data channel responsible for the given MessageReliability.
 // If the data exceeds 10,000 bytes, it is split into multiple segments. An error may be
 // returned while writing one or more segments or the Conn has been closed by [Conn.Close].
@@ -207,10 +221,7 @@ func (conn *Conn) Send(data []byte, reliability MessageReliability) (n int, err 
 		if reliability >= messageReliabilityCapacity {
 			return 0, fmt.Errorf("invalid message reliability: %d", reliability)
 		}
-		segmentSize := int(conn.maxSegmentPayload.Load())
-		if segmentSize == 0 {
-			segmentSize = maxMessageSize
-		}
+		segmentSize := conn.segmentSize()
 		if reliability == MessageReliabilityUnreliable && len(data) > segmentSize {
 			return 0, fmt.Errorf("data larger than %d (received: %d) cannot be sent over UnreliableDataChannel", segmentSize, len(data))
 		}
@@ -242,6 +253,15 @@ func (conn *Conn) Send(data []byte, reliability MessageReliability) (n int, err 
 		}
 		return n, nil
 	}
+}
+
+// segmentSize returns the maximum payload a single message segment may carry, derived from the
+// negotiated 'max-message-size'. It falls back to maxMessageSize until that negotiation completes.
+func (conn *Conn) segmentSize() int {
+	if size := int(conn.maxSegmentPayload.Load()); size != 0 {
+		return size
+	}
+	return maxMessageSize
 }
 
 // closedWriteError wraps the given cause with [net.ErrClosed] so callers
