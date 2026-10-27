@@ -28,6 +28,11 @@ type ListenConfig struct {
 
 	// Log is used for logging messages at various levels.
 	Log *slog.Logger
+
+	// BroadcastCopies makes the Listener send every response and signal to the broadcast address on the
+	// recipient's port as well. Networks with client isolation may drop unicast between two clients while still
+	// forwarding broadcast; recipients match packets by network ID, so the copy reaches the one it is meant for.
+	BroadcastCopies bool
 }
 
 // Listen starts listening on the specified address. For servers, it should be typically composed for using port
@@ -230,6 +235,14 @@ const maxUDPPacketSize = 65535
 func (l *Listener) write(pk Packet, addr net.Addr) error {
 	b := Marshal(pk, l.conf.NetworkID)
 	_, err := l.conn.WriteTo(b, addr)
+	if u, ok := addr.(*net.UDPAddr); ok && l.conf.BroadcastCopies && !u.IP.Equal(net.IPv4bcast) {
+		if _, bErr := l.conn.WriteTo(b, &net.UDPAddr{IP: net.IPv4bcast, Port: u.Port}); bErr != nil {
+			l.conf.Log.Debug("error writing broadcast copy", slog.Any("error", bErr))
+		} else {
+			// The copy is delivered, so a unicast the network refused does not fail the write.
+			err = nil
+		}
+	}
 	return err
 }
 

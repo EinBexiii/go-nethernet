@@ -1,8 +1,11 @@
 package discovery
 
 import (
+	"errors"
+	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -157,4 +160,63 @@ func assertNoSignalReceived(t *testing.T, recorder *signalRecorder) {
 		t.Fatalf("unexpected signal after stop: %#v", signal)
 	case <-time.After(time.Millisecond * 50):
 	}
+}
+
+// recordingConn is a net.PacketConn that records the destination of every write.
+type recordingConn struct {
+	net.PacketConn
+	to       []string
+	failFrom int // writes from this index on fail; 0 never fails
+}
+
+func (c *recordingConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	c.to = append(c.to, addr.String())
+	if c.failFrom > 0 && len(c.to) >= c.failFrom {
+		return 0, errors.New("write refused")
+	}
+	return len(b), nil
+}
+
+func TestWriteSendsBroadcastCopies(t *testing.T) {
+	console := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 184), Port: DefaultPort}
+	pk := &MessagePacket{RecipientID: 2, Data: "CONNECTRESPONSE 1 v=0"}
+
+	off := &recordingConn{}
+	l := &Listener{conn: off, conf: ListenConfig{NetworkID: 1, Log: slog.Default()}}
+	if err := l.write(pk, console); err != nil || strings.Join(off.to, ",") != "192.168.1.184:7551" {
+		t.Fatalf("without copies: err %v, writes %v", err, off.to)
+	}
+
+	on := &recordingConn{}
+	l = &Listener{conn: on, conf: ListenConfig{NetworkID: 1, Log: slog.Default(), BroadcastCopies: true}}
+	if err := l.write(pk, console); err != nil || strings.Join(on.to, ",") != "192.168.1.184:7551,255.255.255.255:7551" {
+		t.Fatalf("with copies: err %v, writes %v", err, on.to)
+	}
+
+	// A broadcast is never copied, and a refused unicast is no error once the copy went out.
+	bc := &recordingConn{}
+	l.conn = bc
+	if err := l.write(&RequestPacket{}, &net.UDPAddr{IP: net.IPv4bcast, Port: DefaultPort}); err != nil || len(bc.to) != 1 {
+		t.Fatalf("broadcast: err %v, writes %v", err, bc.to)
+	}
+	refused := &recordingConn{failFrom: 1}
+	l.conn = refused
+	if err := l.write(pk, console); err == nil {
+		t.Fatalf("both writes refused, want an error")
+	}
+	unicastRefused := &unicastRefusingConn{}
+	l.conn = unicastRefused
+	if err := l.write(pk, console); err != nil {
+		t.Fatalf("unicast refused, copy sent: %v", err)
+	}
+}
+
+// unicastRefusingConn refuses every write except to the broadcast address.
+type unicastRefusingConn struct{ net.PacketConn }
+
+func (unicastRefusingConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if u, ok := addr.(*net.UDPAddr); ok && u.IP.Equal(net.IPv4bcast) {
+		return len(b), nil
+	}
+	return 0, errors.New("no route to host")
 }
